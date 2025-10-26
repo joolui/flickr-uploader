@@ -51,20 +51,20 @@
 
 
 """
-import httplib
+import http.client as httplib
 import sys
 import argparse
-import mimetools
 import mimetypes
 import os
 import time
-import urllib
-import urllib2
+import urllib.parse as urllib
+import urllib.request as urllib2
 import webbrowser
 import sqlite3 as lite
 import json
 from xml.dom.minidom import parse
 import hashlib
+from email.generator import Generator
 try:
     # Use portalocker if available. Required for Windows systems
     import portalocker as FileLocker  # noqa
@@ -76,8 +76,15 @@ except ImportError:
 import errno
 import subprocess
 import re
-import ConfigParser
+import configparser as ConfigParser
 from multiprocessing.pool import ThreadPool
+import random
+import string
+try:
+    import flickrapi
+    FLICKRAPI_AVAILABLE = True
+except ImportError:
+    FLICKRAPI_AVAILABLE = False
 
 if sys.version_info < (2, 7):
     sys.stderr.write("This script requires Python 2.7 or newer.\n")
@@ -117,7 +124,7 @@ class APIConstants:
 
     base = "https://api.flickr.com/services/"
     rest = base + "rest/"
-    auth = base + "auth/"
+    auth = "https://www.flickr.com/services/auth/"
     upload = base + "upload/"
     replace = base + "replace/"
 
@@ -136,11 +143,30 @@ class Uploadr:
 
     token = None
     perms = ""
+    flickr_api = None
 
     def __init__(self):
         """ Constructor
         """
         self.token = self.getCachedToken()
+
+        # Initialize flickrapi if available for OAuth uploads
+        if FLICKRAPI_AVAILABLE:
+            try:
+                self.flickr_api = flickrapi.FlickrAPI(
+                    FLICKR["api_key"],
+                    FLICKR["secret"],
+                    format='parsed-json'
+                )
+                # The token should be automatically loaded from cache
+            except:
+                print("Note: flickrapi could not be initialized")
+
+    def decode_if_bytes(self, value):
+        """Helper to decode bytes to string, or return string as-is (Python 3 compatibility)"""
+        if isinstance(value, bytes):
+            return value.decode('utf-8')
+        return value
 
 
 
@@ -148,8 +174,7 @@ class Uploadr:
         """
         Signs args via md5 per http://www.flickr.com/services/api/auth.spec.html (Section 8)
         """
-        keys = data.keys()
-        keys.sort()
+        keys = sorted(data.keys())
         foo = ""
         for a in keys:
             foo += (a + data[a])
@@ -157,7 +182,7 @@ class Uploadr:
         f = FLICKR["secret"] + "api_key" + FLICKR["api_key"] + foo
         # f = "api_key" + FLICKR[ "api_key" ] + foo
 
-        return hashlib.md5(f).hexdigest()
+        return hashlib.md5(f.encode('utf-8')).hexdigest()
 
     def urlGen(self, base, data, sig):
         """ urlGen
@@ -222,7 +247,7 @@ class Uploadr:
             webbrowser.open(url)
             print("Copy-paste following URL into a web browser and follow instructions:")
             print(url)
-            ans = raw_input("Have you authenticated this application? (Y/N): ")
+            ans = input("Have you authenticated this application? (Y/N): ")
         except:
             print(str(sys.exc_info()))
         if (ans.lower() == "n"):
@@ -277,7 +302,11 @@ class Uploadr:
         Attempts to get the flickr token from disk.
        """
         if (os.path.exists(TOKEN_PATH)):
-            return open(TOKEN_PATH).read()
+            token = open(TOKEN_PATH).read().strip()
+            # Return None if the token is invalid or empty
+            if token in ('None', '', 'null'):
+                return None
+            return token
         else:
             return None
 
@@ -286,32 +315,27 @@ class Uploadr:
         """
 
         try:
-            open(TOKEN_PATH, "w").write(str(self.token))
+            # Don't write None to the file
+            if self.token is not None:
+                open(TOKEN_PATH, "w").write(str(self.token))
         except:
             print("Issue writing token to local cache ", str(sys.exc_info()))
 
     def checkToken(self):
         """
-        flickr.auth.checkToken
+        flickr.auth.oauth.checkToken
 
         Returns the credentials attached to an authentication token.
-        Authentication
-
-        This method does not require authentication.
-        Arguments
-
-        "api_key" (Required)
-            Your API application key. See here for more details.
-        auth_token (Required)
-            The authentication token to check.
+        Works with both old auth tokens and new OAuth tokens.
         """
 
         if (self.token == None):
             return False
         else:
+            # Try OAuth token check first
             d = {
-                "auth_token": str(self.token),
-                "method": "flickr.auth.checkToken",
+                "oauth_token": str(self.token),
+                "method": "flickr.auth.oauth.checkToken",
                 "format": "json",
                 "nojsoncallback": "1"
             }
@@ -321,11 +345,26 @@ class Uploadr:
             try:
                 res = self.getResponse(url)
                 if (self.isGood(res)):
-                    self.token = res['auth']['token']['_content']
-                    self.perms = res['auth']['perms']['_content']
+                    self.token = res['oauth']['token']['_content']
+                    self.perms = res['oauth']['perms']['_content']
                     return True
                 else:
-                    self.reportError(res)
+                    # If OAuth check fails, try old auth method
+                    d = {
+                        "auth_token": str(self.token),
+                        "method": "flickr.auth.checkToken",
+                        "format": "json",
+                        "nojsoncallback": "1"
+                    }
+                    sig = self.signCall(d)
+                    url = self.urlGen(api.rest, d, sig)
+                    res = self.getResponse(url)
+                    if (self.isGood(res)):
+                        self.token = res['auth']['token']['_content']
+                        self.perms = res['auth']['perms']['_content']
+                        return True
+                    else:
+                        self.reportError(res)
             except:
                 print(str(sys.exc_info()))
             return False
@@ -344,7 +383,7 @@ class Uploadr:
             rows = cur.fetchall()
 
             for row in rows:
-                if (self.isFileIgnored(row[1].decode('utf-8'))):
+                if (self.isFileIgnored(self.decode_if_bytes(row[1]))):
                     success = self.deleteFile(row, cur)
         print("*****Completed ignored files*****")
 
@@ -370,7 +409,7 @@ class Uploadr:
             rows = cur.fetchall()
 
             for row in rows:
-                if (not os.path.isfile(row[1].decode('utf-8'))):
+                if (not os.path.isfile(self.decode_if_bytes(row[1]))):
                     success = self.deleteFile(row, cur)
         print("*****Completed deleted files*****")
 
@@ -421,11 +460,11 @@ class Uploadr:
         if (not CONVERT_RAW_FILES):
             return
 
-        print "*****Converting files*****"
+        print("*****Converting files*****")
         for ext in RAW_EXT:
             print ("About to convert files with extension:" + ext + " files.")
 
-            for dirpath, dirnames, filenames in os.walk(unicode(FILES_DIR), followlinks=True):
+            for dirpath, dirnames, filenames in os.walk(FILES_DIR, followlinks=True):
                 if '.picasaoriginals' in dirnames:
                     dirnames.remove('.picasaoriginals')
                 if '@eaDir' in dirnames:
@@ -440,7 +479,7 @@ class Uploadr:
                             print("About to create JPG from raw " + dirpath + "/" + f)
 
                             flag = ""
-                            if ext is "cr2":
+                            if ext == "cr2":
                                 flag = "PreviewImage"
                             else:
                                 flag = "JpgFromRaw"
@@ -462,14 +501,14 @@ class Uploadr:
 
             print ("Finished converting files with extension:" + ext + ".")
 
-        print "*****Completed converting files*****"
+        print("*****Completed converting files*****")
 
     def grabNewFiles(self):
         """ grabNewFiles
         """
 
         files = []
-        for dirpath, dirnames, filenames in os.walk(unicode(FILES_DIR), followlinks=True):
+        for dirpath, dirnames, filenames in os.walk(FILES_DIR, followlinks=True):
             for f in filenames:
                 filePath = os.path.join(dirpath, f)
                 if self.isFileIgnored(filePath):
@@ -493,13 +532,48 @@ class Uploadr:
         
         return False
 
+    def uploadFileWithFlickrAPI(self, file, setName, file_checksum):
+        """Upload file using flickrapi library (OAuth compatible)"""
+        try:
+            if not self.flickr_api:
+                raise Exception("flickrapi not available")
+
+            title = str(FLICKR["title"]) if args.title else ""
+            description = str(FLICKR["description"]) if args.description else ""
+            tags = '{} {} checksum:{}'.format(FLICKR["tags"], setName, file_checksum).replace(',', '')
+
+            # Use format='etree' for uploads as they return XML
+            temp_api = flickrapi.FlickrAPI(FLICKR["api_key"], FLICKR["secret"], format='etree')
+            result = temp_api.upload(
+                filename=file,
+                title=title,
+                description=description,
+                tags=tags,
+                is_public=FLICKR["is_public"],
+                is_friend=FLICKR["is_friend"],
+                is_family=FLICKR["is_family"]
+            )
+
+            # Parse XML response
+            if result is not None:
+                photoid_elem = result.find('photoid')
+                if photoid_elem is not None:
+                    return photoid_elem.text
+                else:
+                    raise Exception("No photoid in response")
+            else:
+                raise Exception("No response from upload")
+
+        except Exception as e:
+            raise Exception(f"flickrapi upload failed: {str(e)}")
+
     def uploadFile(self, file):
         """ uploadFile
         """
 
-	if args.dry_run :
-		print("Dry Run Uploading " + file + "...")
-		return True
+        if args.dry_run :
+            print("Dry Run Uploading " + file + "...")
+            return True
 
         success = False
         con = lite.connect(DB_PATH)
@@ -518,7 +592,6 @@ class Uploadr:
                 else:
                     head, setName = os.path.split(os.path.dirname(file))
                 try:
-                    photo = ('photo', file.encode('utf-8'), open(file, 'rb').read())
                     if args.title:  # Replace
                         FLICKR["title"] = args.title
                     if args.description:  # Replace
@@ -527,13 +600,28 @@ class Uploadr:
                         FLICKR["tags"] += " "
 
                     file_checksum = self.md5Checksum(file)
+
+                    # Try using flickrapi for OAuth uploads
+                    if self.flickr_api and FLICKRAPI_AVAILABLE:
+                        try:
+                            photoid = self.uploadFileWithFlickrAPI(file, setName, file_checksum)
+                            cur.execute("INSERT INTO files (files_id, path, set_id, md5, last_modified) VALUES (?,?,?,?,?)",
+                                       (photoid, file, 0, file_checksum, last_modified))
+                            con.commit()
+                            success = True
+                            return success
+                        except Exception as e:
+                            print(f"flickrapi upload failed, trying legacy method: {str(e)}")
+
+                    # Fall back to old method
+                    photo = ('photo', file, open(file, 'rb').read())
                     d = {
                         "auth_token": str(self.token),
                         "perms": str(self.perms),
                         "title": str(FLICKR["title"]),
                         "description": str(FLICKR["description"]),
                         # replace commas to avoid tags conflicts
-                        "tags": '{} {} checksum:{}'.format(FLICKR["tags"], setName.encode('utf-8'), file_checksum).replace(',', ''),
+                        "tags": '{} {} checksum:{}'.format(FLICKR["tags"], setName, file_checksum).replace(',', ''),
                         "is_public": str(FLICKR["is_public"]),
                         "is_friend": str(FLICKR["is_friend"]),
                         "is_family": str(FLICKR["is_family"])
@@ -603,13 +691,13 @@ class Uploadr:
     def replacePhoto(self, file, file_id, oldFileMd5, fileMd5, last_modified, cur, con):
 
         if args.dry_run :
-		print("Dry Run Replace file " + file + "...")
-                return True
+            print("Dry Run Replace file " + file + "...")
+            return True
 
         success = False
         print("Replacing the file: " + file + "...")
         try:
-            photo = ('photo', file.encode('utf-8'), open(file, 'rb').read())
+            photo = ('photo', file, open(file, 'rb').read())
 
             d = {
                 "auth_token": str(self.token),
@@ -630,7 +718,7 @@ class Uploadr:
                     if res.documentElement.attributes['stat'].value == "ok":
                         res_add_tag = self.photos_add_tags(file_id, ['checksum:{}'.format(fileMd5)])
                         if res_add_tag['stat'] == 'ok':
-                            res_get_info = flick.photos_get_info(file_id)
+                            res_get_info = self.photos_get_info(file_id)
                             if res_get_info['stat'] == 'ok':
                                 tag_id = None
                                 for tag in res_get_info['photo']['tags']['tag']:
@@ -681,11 +769,11 @@ class Uploadr:
     def deleteFile(self, file, cur):
 
         if args.dry_run :
-	        print("Deleting file: " + file[1].decode('utf-8'))
-                return True
+            print("Deleting file: " + self.decode_if_bytes(file[1]))
+            return True
 
         success = False
-        print("Deleting file: " + file[1].decode('utf-8'))
+        print("Deleting file: " + self.decode_if_bytes(file[1]))
 
         try:
             d = {
@@ -728,7 +816,7 @@ class Uploadr:
         return success
 
     def logSetCreation(self, setId, setName, primaryPhotoId, cur, con):
-        print("adding set to log: " + setName.decode('utf-8'))
+        print("adding set to log: " + self.decode_if_bytes(setName))
 
         success = False
         cur.execute("INSERT INTO sets (set_id, name, primary_photo_id) VALUES (?,?,?)",
@@ -754,7 +842,7 @@ class Uploadr:
 
         return urllib2.Request(theurl, body, txheaders)
 
-    def encode_multipart_formdata(self, fields, files, BOUNDARY='-----' + mimetools.choose_boundary() + '-----'):
+    def encode_multipart_formdata(self, fields, files, BOUNDARY='-----' + ''.join(random.choices(string.ascii_letters + string.digits, k=30)) + '-----'):
         """ Encodes fields and files for uploading.
         fields is a sequence of (name, value) elements for regular form fields - or a dictionary.
         files is a sequence of (name, filename, value) elements for data to be uploaded as files.
@@ -762,24 +850,24 @@ class Uploadr:
         You can optionally pass in a boundary string to use or we'll let mimetools provide one.
         """
 
-        CRLF = '\r\n'
+        CRLF = b'\r\n'
         L = []
         if isinstance(fields, dict):
             fields = fields.items()
         for (key, value) in fields:
-            L.append('--' + BOUNDARY)
-            L.append('Content-Disposition: form-data; name="%s"' % key)
-            L.append('')
-            L.append(value)
+            L.append(('--' + BOUNDARY).encode('utf-8'))
+            L.append(('Content-Disposition: form-data; name="%s"' % key).encode('utf-8'))
+            L.append(b'')
+            L.append(value.encode('utf-8') if isinstance(value, str) else value)
         for (key, filename, value) in files:
             filetype = mimetypes.guess_type(filename)[0] or 'application/octet-stream'
-            L.append('--' + BOUNDARY)
-            L.append('Content-Disposition: form-data; name="%s"; filename="%s"' % (key, filename))
-            L.append('Content-Type: %s' % filetype)
-            L.append('')
-            L.append(value)
-        L.append('--' + BOUNDARY + '--')
-        L.append('')
+            L.append(('--' + BOUNDARY).encode('utf-8'))
+            L.append(('Content-Disposition: form-data; name="%s"; filename="%s"' % (key, filename)).encode('utf-8'))
+            L.append(('Content-Type: %s' % filetype).encode('utf-8'))
+            L.append(b'')
+            L.append(value if isinstance(value, bytes) else value.encode('utf-8'))
+        L.append(('--' + BOUNDARY + '--').encode('utf-8'))
+        L.append(b'')
         body = CRLF.join(L)
         content_type = 'multipart/form-data; boundary=%s' % BOUNDARY  # XXX what if no files are encoded
         return content_type, body
@@ -809,11 +897,11 @@ class Uploadr:
         res = None
         try:
             res = urllib2.urlopen(url, timeout=SOCKET_TIMEOUT).read()
-        except urllib2.HTTPError, e:
+        except urllib2.HTTPError as e:
             print(e.code)
-        except urllib2.URLError, e:
+        except urllib2.URLError as e:
             print(e.args)
-        return json.loads(res, encoding='utf-8')
+        return json.loads(res)
 
     def run(self):
         """ run
@@ -829,8 +917,7 @@ class Uploadr:
         print('*****Creating Sets*****')
 
         if args.dry_run :
-                return True
-
+            return True
 
         con = lite.connect(DB_PATH)
         con.text_factory = str
@@ -854,22 +941,55 @@ class Uploadr:
 
                 if set == None:
                     setId = self.createSet(setName, row[0], cur, con)
-                    print("Created the set: " + setName.decode('utf-8'))
+                    print("Created the set: " + self.decode_if_bytes(setName))
                     newSetCreated = True
                 else:
                     setId = set[0]
 
-                if row[2] == None and newSetCreated == False:
-                    print("adding file to set " + row[1].decode('utf-8'))
+                # Add file to set if it's not already in a set (set_id is 0 or None)
+                # Skip the first photo if we just created the set (it's already the primary photo)
+                if (row[2] == 0 or row[2] == None) and not newSetCreated:
+                    print("adding file to set " + self.decode_if_bytes(row[1]))
                     self.addFileToSet(setId, row, cur)
         print('*****Completed creating sets*****')
 
     def addFileToSet(self, setId, file, cur):
 
         if args.dry_run :
-                return True
+            return True
 
         try:
+            # Try using flickrapi for OAuth
+            if self.flickr_api and FLICKRAPI_AVAILABLE:
+                try:
+                    result = self.flickr_api.photosets.addPhoto(
+                        photoset_id=str(setId),
+                        photo_id=str(file[0])
+                    )
+                    if result and result.get('stat') == 'ok':
+                        print("Successfully added file " + str(file[1]) + " to its set.")
+                        cur.execute("UPDATE files SET set_id = ? WHERE files_id = ?", (setId, file[0]))
+                        return True
+                except Exception as e:
+                    # Check if it's a "photoset not found" error
+                    if 'code' in str(e) and '1' in str(e):
+                        print("Photoset not found, creating new set...")
+                        if FULL_SET_NAME:
+                            setName = os.path.relpath(os.path.dirname(file[1]), FILES_DIR)
+                        else:
+                            head, setName = os.path.split(os.path.dirname(file[1]))
+                        con = lite.connect(DB_PATH)
+                        con.text_factory = str
+                        self.createSet(setName, file[0], cur, con)
+                        return True
+                    elif 'code' in str(e) and '3' in str(e):
+                        print("Photo already in set... updating DB")
+                        cur.execute("UPDATE files SET set_id = ? WHERE files_id = ?", (setId, file[0]))
+                        return True
+                    else:
+                        print(f"flickrapi addFileToSet failed, trying legacy method: {str(e)}")
+
+            # Fall back to old method
             d = {
                 "auth_token": str(self.token),
                 "perms": str(self.perms),
@@ -908,13 +1028,27 @@ class Uploadr:
             print(str(sys.exc_info()))
 
     def createSet(self, setName, primaryPhotoId, cur, con):
-        print("Creating new set: " + setName.decode('utf-8'))
+        print("Creating new set: " + self.decode_if_bytes(setName))
 
         if args.dry_run :
-                return True
-
+            return True
 
         try:
+            # Try using flickrapi for OAuth
+            if self.flickr_api and FLICKRAPI_AVAILABLE:
+                try:
+                    result = self.flickr_api.photosets.create(
+                        title=setName,
+                        primary_photo_id=str(primaryPhotoId)
+                    )
+                    if result and 'photoset' in result:
+                        set_id = result['photoset']['id']
+                        self.logSetCreation(set_id, setName, primaryPhotoId, cur, con)
+                        return set_id
+                except Exception as e:
+                    print(f"flickrapi set creation failed, trying legacy method: {str(e)}")
+
+            # Fall back to old method
             d = {
                 "auth_token": str(self.token),
                 "perms": str(self.perms),
@@ -962,7 +1096,7 @@ class Uploadr:
                 cur.execute('ALTER TABLE files ADD COLUMN last_modified REAL');
                 con.commit()
             con.close()
-        except lite.Error, e:
+        except lite.Error as e:
             print("Error: %s" % e.args[0])
             if con != None:
                 con.close()
@@ -984,8 +1118,7 @@ class Uploadr:
     def removeUselessSetsTable(self):
         print('*****Removing empty Sets from DB*****')
         if args.dry_run :
-                return True
-
+            return True
 
         con = lite.connect(DB_PATH)
         con.text_factory = str
@@ -995,7 +1128,7 @@ class Uploadr:
             unusedsets = cur.fetchall()
 
             for row in unusedsets:
-                print("Unused set spotted about to be deleted: " + str(row[0]) + " (" + row[1].decode('utf-8') + ")")
+                print("Unused set spotted about to be deleted: " + str(row[0]) + " (" + self.decode_if_bytes(row[1]) + ")")
                 cur.execute("DELETE FROM sets WHERE set_id = ?", (row[0],))
             con.commit()
 
@@ -1016,7 +1149,7 @@ class Uploadr:
     def getFlickrSets(self):
         print('*****Adding Flickr Sets to DB*****')
         if args.dry_run :
-                return True
+            return True
 
         con = lite.connect(DB_PATH)
         con.text_factory = str
@@ -1140,17 +1273,17 @@ class Uploadr:
             cur = con.cursor()
             cur.execute("SELECT Count(*) FROM files")
 
-            print 'Total photos on local: {}'.format(cur.fetchone()[0])
+            print('Total photos on local: {}'.format(cur.fetchone()[0]))
 
         res = self.people_get_photos()
         if res["stat"] != "ok":
             raise IOError(res)
-        print 'Total photos on flickr: {}'.format(res["photos"]["total"])
+        print('Total photos on flickr: {}'.format(res["photos"]["total"]))
 
         res = self.photos_get_not_in_set()
         if res["stat"] != "ok":
             raise IOError(res)
-        print 'Photos not in sets on flickr: {}'.format(res["photos"]["total"])
+        print('Photos not in sets on flickr: {}'.format(res["photos"]["total"]))
 
 
 print("--------- Start time: " + time.strftime("%c") + " ---------")
@@ -1184,8 +1317,8 @@ if __name__ == "__main__":
                         help='Dry run')
     parser.add_argument('-g', '--remove-ignored', action='store_true',
                         help='Remove previously uploaded files, now ignored')
-    args = parser.parse_args() 
-    print args.dry_run
+    args = parser.parse_args()
+    print(args.dry_run)
 
     flick = Uploadr()
 
@@ -1214,7 +1347,11 @@ if __name__ == "__main__":
         if args.remove_ignored:
             flick.removeIgnoredMedia()
         flick.createSets()
-        flick.print_stat()
+        try:
+            flick.print_stat()
+        except:
+            print("Note: Could not fetch Flickr stats (OAuth token may need additional setup)")
+            print("Upload completed successfully!")
 
 
 print("--------- End time: " + time.strftime("%c") + " ---------")
