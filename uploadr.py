@@ -65,6 +65,7 @@ import json
 from xml.dom.minidom import parse
 import hashlib
 from email.generator import Generator
+import signal
 try:
     # Use portalocker if available. Required for Windows systems
     import portalocker as FileLocker  # noqa
@@ -676,7 +677,9 @@ class Uploadr:
                         'INSERT INTO files (files_id, path, md5, last_modified, tagged) VALUES (?, ?, ?, ?, 1)',
                         (file_id, file, file_checksum, last_modified))
                     success = True
-                except:
+                except KeyboardInterrupt:
+                    raise  # Don't catch Ctrl+C, let it propagate
+                except Exception:
                     print(str(sys.exc_info()))
             elif (MANAGE_CHANGES):
                 if (row[6] == None):
@@ -1286,7 +1289,17 @@ class Uploadr:
         print('Photos not in sets on flickr: {}'.format(res["photos"]["total"]))
 
 
+def signal_handler(sig, frame):
+    """Handle Ctrl+C gracefully"""
+    print("\n\n*** Upload interrupted by user (Ctrl+C) ***")
+    print("Exiting gracefully...")
+    sys.exit(0)
+
+# Register signal handler for Ctrl+C
+signal.signal(signal.SIGINT, signal_handler)
+
 print("--------- Start time: " + time.strftime("%c") + " ---------")
+print("Press Ctrl+C to stop the upload at any time")
 if __name__ == "__main__":
     # Ensure that only one instance of this script is running
     try:

@@ -96,6 +96,8 @@ python uploadr.py
 
 It will crawl through all the files from the FILES_DIR directory and begin the upload process.
 
+**Note:** You can press **Ctrl+C** at any time to stop the upload gracefully. The script will exit immediately without processing remaining files.
+
 **Album Organization:** Photos are automatically organized into Flickr albums based on their folder structure. For example:
 ```
 /path/to/your/photos/
